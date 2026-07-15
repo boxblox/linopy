@@ -174,6 +174,7 @@ def _installed_version_in(pkg: str, spec: str) -> bool:
 
 if TYPE_CHECKING:
     import cupdlpx
+    import gamspy
     import gurobipy
     import highspy
     import mosek
@@ -302,6 +303,7 @@ mosek = _LazyModule("mosek")
 mindoptpy = _LazyModule("mindoptpy")
 coptpy = _LazyModule("coptpy")
 cupdlpx = _LazyModule("cupdlpx")
+gamspy = _LazyModule("gamspy")  # type: ignore[assignment]
 
 
 def _has_module(name: str) -> bool:
@@ -353,6 +355,7 @@ class SolverName(enum.Enum):
     Xpress = "xpress"
     Knitro = "knitro"
     Mosek = "mosek"
+    GAMS = "gams"
     COPT = "copt"
     MindOpt = "mindopt"
     PIPS = "pips"
@@ -3802,6 +3805,350 @@ class Mosek(Solver[None]):
         return self._make_result(status, solution, solver_model=m)
 
 
+_GAMS_KIND_TO_VARTYPE: dict[str, str] = {
+    "C": "free",
+    "B": "binary",
+    "I": "integer",
+    "S": "semicont",
+}
+
+
+class GAMS(Solver["gamspy.Container | None"]):
+    """
+    Solver subclass driving GAMS through the ``gamspy`` Python API.
+
+    Direct-API only: ``model.solve("gams")`` always builds a ``gamspy``
+    model straight from ``model.matrices``, without writing an LP/MPS file.
+
+    Attributes
+    ----------
+    **solver_options
+        Options for the given solver. The special key ``"solver"`` selects
+        the GAMS sub-solver (e.g. ``{"solver": "CPLEX"}``); keys matching a
+        ``gamspy.Options`` field are passed as GAMS options, everything else
+        is passed through as solver-specific options.
+    """
+
+    display_name: ClassVar[str] = "GAMS"
+    features: ClassVar[frozenset[SolverFeature]] = frozenset(
+        {
+            SolverFeature.INTEGER_VARIABLES,
+            SolverFeature.SOS_CONSTRAINTS,
+            SolverFeature.SEMI_CONTINUOUS_VARIABLES,
+            SolverFeature.DIRECT_API,
+            SolverFeature.SOLUTION_FILE_NOT_NEEDED,
+        }
+    )
+
+    @classmethod
+    @functools.cache
+    def is_available(cls) -> bool:
+        return _has_module("gamspy")
+
+    @classmethod
+    def _license_probe(cls) -> None:
+        """Build+solve the smallest possible scalar LP as a real license round trip."""
+        cont = gamspy.Container()
+        x = gamspy.Variable(cont, name="x", type="free")
+        eq = gamspy.Equation(cont, name="eq")
+        eq[...] = x == 1
+        m = gamspy.Model(cont, name="m", problem="lp", sense="min", objective=x, equations=[eq])
+        m.solve(output=None)
+
+    def _build(self, **build_kwargs: Any) -> None:
+        """Force the direct API — GAMS has no LP/MPS/GDX file build path."""
+        if self.io_api is not None and self.io_api != "direct":
+            warnings.warn(
+                f"{self.display_name} only supports the direct API; "
+                f"ignoring io_api={self.io_api!r}.",
+                UserWarning,
+                stacklevel=2,
+            )
+        self.io_api = "direct"
+        for key in (
+            "problem_fn",
+            "slice_size",
+            "progress",
+            "explicit_coordinate_names",
+        ):
+            build_kwargs.pop(key, None)
+        super()._build(**build_kwargs)
+
+    _MODEL_STAT_MAP: ClassVar[dict[int, str]] = {
+        1: "optimal",
+        2: "optimal",
+        3: "unbounded",
+        4: "infeasible",
+        5: "infeasible",
+        6: "infeasible",
+        7: "suboptimal",
+        8: "suboptimal",
+        10: "infeasible",
+        11: "licensing_problems",
+        17: "suboptimal",
+        19: "infeasible",
+    }
+    _SOLVE_STAT_MAP: ClassVar[dict[int, str]] = {
+        2: "iteration_limit",
+        3: "time_limit",
+        7: "licensing_problems",
+        8: "user_interrupt",
+        9: "internal_solver_error",
+        10: "internal_solver_error",
+        11: "internal_solver_error",
+        13: "internal_solver_error",
+    }
+
+    def _build_direct(self, **kwargs: Any) -> None:
+        model = self.model
+        assert model is not None
+        model.constraints.sanitize_missings()
+        M = model.matrices
+        n = len(M.vlabels)
+        n_cons = len(M.clabels) if M.A is not None else 0
+
+        cont = gamspy.Container()
+        j = gamspy.Set(cont, name="j", records=[f"j{k}" for k in range(n)])
+        lb_full = gamspy.Parameter(
+            cont,
+            name="lb_full",
+            domain=[j],
+            records=[(f"j{k}", float(v)) for k, v in enumerate(M.lb)],
+        )
+        ub_full = gamspy.Parameter(
+            cont,
+            name="ub_full",
+            domain=[j],
+            records=[(f"j{k}", float(v)) for k, v in enumerate(M.ub)],
+        )
+        c_full = gamspy.Parameter(
+            cont,
+            name="c_full",
+            domain=[j],
+            records=[(f"j{k}", float(v)) for k, v in enumerate(M.c)],
+        )
+
+        sos_groups = list(_iter_sos_sets(model))
+        sos_positions: set[int] = set()
+        for _, positions, _ in sos_groups:
+            sos_positions.update(int(p) for p in positions)
+        is_sos = np.zeros(n, dtype=bool)
+        if sos_positions:
+            is_sos[list(sos_positions)] = True
+
+        # (domain_set, variable) pairs contributing to the objective/rows.
+        var_terms: list[tuple[Any, Any]] = []
+        for kind, vartype in _GAMS_KIND_TO_VARTYPE.items():
+            positions = np.flatnonzero((M.vtypes == kind) & ~is_sos)
+            if positions.size == 0:
+                continue
+            sub = gamspy.Set(
+                cont,
+                name=f"j{kind.lower()}",
+                domain=[j],
+                records=[f"j{p}" for p in positions],
+            )
+            var = gamspy.Variable(
+                cont, name=f"x{kind.lower()}", type=vartype, domain=[j]
+            )
+            var.lo[sub] = lb_full[sub]
+            var.up[sub] = ub_full[sub]
+            var_terms.append((sub, var))
+
+        s_set = None
+        if sos_groups:
+            s_set = gamspy.Set(
+                cont, name="s", records=[f"s{gi}" for gi in range(len(sos_groups))]
+            )
+        for sos_type, set_name, var_name, vartype in (
+            (1, "js1", "xs1", "sos1"),
+            (2, "js2", "xs2", "sos2"),
+        ):
+            group_records = [
+                (f"s{gi}", f"j{int(p)}")
+                for gi, (t, positions, _) in enumerate(sos_groups)
+                if t == sos_type
+                for p in positions
+            ]
+            if not group_records:
+                continue
+            assert s_set is not None
+            dom = gamspy.Set(
+                cont, name=set_name, domain=[s_set, j], records=group_records
+            )
+            var = gamspy.Variable(cont, name=var_name, type=vartype, domain=[s_set, j])
+            var.lo[dom[s_set, j]] = lb_full[j]
+            var.up[dom[s_set, j]] = ub_full[j]
+            var_terms.append((dom, var))
+
+        def sum_domain_and_index(dom: Any) -> tuple[Any, Any]:
+            """
+            Return ``(sum_domain, member_index)`` for a ``var_terms`` entry.
+
+            For plain per-kind subsets ``dom`` (domain ``[j]``), both are
+            ``dom`` itself. For the SOS group subsets (domain ``[s_set, j]``),
+            summation runs over the 2-dim subset while coefficient parameters
+            (which only have a ``j`` domain) are indexed by ``j`` alone.
+            """
+            if s_set is not None and dom.domain == [s_set, j]:
+                return dom[s_set, j], j
+            return dom, dom
+
+        obj = gamspy.Variable(cont, name="obj", type="free")
+        eobj = gamspy.Equation(cont, name="eobj")
+        obj_expr: Any = 0
+        for dom, var in var_terms:
+            sum_dom, idx = sum_domain_and_index(dom)
+            obj_expr = obj_expr + gamspy.Sum(sum_dom, c_full[idx] * var[dom])
+        eobj[...] = obj_expr == obj
+        equations = [eobj]
+
+        if M.A is not None and n_cons:
+            i = gamspy.Set(cont, name="i", records=[f"i{k}" for k in range(n_cons)])
+            Acoo = M.A.tocoo()
+            a = gamspy.Parameter(
+                cont,
+                name="a",
+                domain=[i, j],
+                records=[
+                    (f"i{r}", f"j{cc}", float(v))
+                    for r, cc, v in zip(Acoo.row, Acoo.col, Acoo.data)
+                ],
+            )
+            b_par = gamspy.Parameter(
+                cont,
+                name="b_par",
+                domain=[i],
+                records=[(f"i{k}", float(v)) for k, v in enumerate(M.b)],
+            )
+            for sense, set_name, eq_name, op in (
+                (">", "ig", "eg", "__ge__"),
+                ("<", "il", "el", "__le__"),
+                ("=", "ie", "ee", "__eq__"),
+            ):
+                positions = np.flatnonzero(M.sense == sense)
+                if positions.size == 0:
+                    continue
+                row_set = gamspy.Set(
+                    cont,
+                    name=set_name,
+                    domain=[i],
+                    records=[f"i{p}" for p in positions],
+                )
+
+                row_expr: Any = 0
+                for dom, var in var_terms:
+                    sum_dom, idx = sum_domain_and_index(dom)
+                    row_expr = row_expr + gamspy.Sum(
+                        sum_dom, a[row_set, idx] * var[dom]
+                    )
+                eq = gamspy.Equation(cont, name=eq_name, domain=[i])
+                eq[row_set] = getattr(row_expr, op)(b_par[row_set])
+                equations.append(eq)
+
+        is_mip = bool((M.vtypes != "C").any() or sos_groups)
+        gams_model = gamspy.Model(
+            cont,
+            name="m",
+            problem="mip" if is_mip else "lp",
+            sense=model.sense,
+            objective=obj,
+            equations=equations,
+        )
+
+        self.solver_model = gams_model
+        self.io_api = "direct"
+        self.sense = model.sense
+        self._cache_model_labels(model)
+
+    @staticmethod
+    def _scatter_by_position(
+        records: pd.DataFrame, column: str, value_column: str, size: int
+    ) -> np.ndarray:
+        """Scatter GAMS records into a dense array indexed by the position parsed from `column`."""
+        out = np.full(size, np.nan)
+        if records.empty:
+            return out
+        positions = records[column].astype(str).str[1:].astype(int).to_numpy()
+        out[positions] = records[value_column].to_numpy(dtype=float)
+        return out
+
+    def _solve_kwargs(self, options_fields: set[str]) -> dict[str, Any]:
+        opts = dict(self.options)
+        kwargs: dict[str, Any] = {}
+        if "solver" in opts:
+            kwargs["solver"] = opts.pop("solver")
+        matches = {k: v for k, v in opts.items() if k in options_fields}
+        leftovers = {k: v for k, v in opts.items() if k not in options_fields}
+        if matches:
+            kwargs["options"] = gamspy.Options(**matches)
+        if leftovers:
+            kwargs["solver_options"] = leftovers
+        return kwargs
+
+    def _run_direct(
+        self,
+        solution_fn: Path | None = None,
+        log_fn: Path | None = None,
+        warmstart_fn: Path | None = None,
+        basis_fn: Path | None = None,
+        env: Any = None,
+        **kw: Any,
+    ) -> Result:
+        m = self.solver_model
+        assert m is not None
+        options_fields = set(gamspy.Options.model_fields.keys())
+        solve_kwargs = self._solve_kwargs(options_fields)
+
+        if log_fn is not None:
+            with open(path_to_string(log_fn), "w") as fh:
+                m.solve(output=fh, **solve_kwargs)
+        else:
+            m.solve(output=sys.stdout, **solve_kwargs)
+
+        model_stat = int(m.status.value)
+        solve_stat = int(m.solve_status.value)
+        termination = self._SOLVE_STAT_MAP.get(
+            solve_stat, self._MODEL_STAT_MAP.get(model_stat, "unknown")
+        )
+        status = Status.from_termination_condition(termination)
+        status.legacy_status = (str(solve_stat), str(model_stat))
+
+        def get_solver_solution() -> Solution:
+            objective = m.objective_value
+            objective = float(objective) if objective is not None else np.nan
+
+            # Decision variables/rows are the ones we declared, minus the
+            # bookkeeping symbols "obj"/"eobj" — looked up from the
+            # Container rather than tracked separately at build time.
+            cont = m.container
+            n = len(cont["j"].records)
+            n_cons = len(cont["i"].records) if "i" in cont.data else 0
+
+            primal = np.full(n, np.nan)
+            for var in cont.getVariables():
+                if var.name == "obj":
+                    continue
+                filled = self._scatter_by_position(var.records, "j", "level", n)
+                mask = ~np.isnan(filled)
+                primal[mask] = filled[mask]
+            sol = _solution_from_labels(primal, self._vlabels, self._n_vars)
+
+            dual_arr = np.full(n_cons, np.nan)
+            for eq in cont.getEquations():
+                if eq.name == "eobj":
+                    continue
+                filled = self._scatter_by_position(eq.records, "i", "marginal", n_cons)
+                mask = ~np.isnan(filled)
+                dual_arr[mask] = filled[mask]
+            dual = _solution_from_labels(dual_arr, self._clabels, self._n_cons)
+
+            return Solution(sol, dual, objective)
+
+        solution = self.safe_get_solution(status=status, func=get_solver_solution)
+        return self._make_result(status, solution, solver_model=m)
+
+
 class COPT(Solver[None]):
     """
     Solver subclass for the COPT solver.
@@ -4384,6 +4731,7 @@ _SOLVER_PROBE_ORDER: tuple[str, ...] = (
     "xpress",
     "knitro",
     "mosek",
+    "gams",
     "mindopt",
     "copt",
     "cupdlpx",
