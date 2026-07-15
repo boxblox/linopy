@@ -80,6 +80,7 @@ dev = [
     "types-requests",
     "gurobipy",
     "highspy",
+    "gamspy",
     "jupyter",
 ]
 # Perf-relevant deps pinned exactly so run-to-run deltas reflect linopy
@@ -109,6 +110,7 @@ solvers = [
     "xpress; platform_system != 'Darwin'",
     "pyscipopt; platform_system != 'Darwin'",
     "knitro>=15.1.0",
+    "gamspy",
     # "cupdlpx>=0.1.2", pip package currently unstable
 ]
 
