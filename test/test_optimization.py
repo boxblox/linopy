@@ -560,6 +560,7 @@ def test_solver_time_limit_options(
         "mindopt": {"MaxTime": 1},
         "copt": {"TimeLimit": 1},
         "cupdlpx": {"TimeLimit": 1},
+        "gams": {"time_limit": 1},
     }
     status, condition = model.solve(
         solver,
