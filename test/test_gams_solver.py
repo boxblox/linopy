@@ -8,9 +8,14 @@ import pandas as pd
 import pytest
 import xarray as xr
 
-from linopy import GREATER_EQUAL, Model, solvers
+from linopy import GREATER_EQUAL, Model, Variable, solvers
 from linopy.constants import TerminationCondition
-from linopy.solvers import GAMS, _iter_sos_sets
+from linopy.solvers import (
+    GAMS,
+    _iter_sos_sets,
+    _names_to_labels,
+    _truncate_for_gams_uel,
+)
 
 pytestmark = pytest.mark.skipif(
     "gams" not in solvers.licensed_solvers, reason="GAMS/gamspy license not available"
@@ -189,3 +194,92 @@ def test_solve_qp_with_sos_not_supported() -> None:
 
     with pytest.raises(NotImplementedError, match="SOS constraints"):
         m.solve("gams")
+
+
+def test_truncate_for_gams_uel_preserves_suffix_and_uniqueness() -> None:
+    long_prefix = "a" * 80
+    names = [f"{long_prefix}#0", f"{long_prefix}#1"]
+
+    truncated = _truncate_for_gams_uel(names, limit=63)
+
+    assert all(len(n) <= 63 for n in truncated)
+    assert truncated[0].endswith("#0")
+    assert truncated[1].endswith("#1")
+    assert truncated[0] != truncated[1]
+    # Round-trips to the correct labels even though the prefixes collide.
+    assert _names_to_labels(truncated).tolist() == [0, 1]
+
+
+def test_truncate_for_gams_uel_leaves_short_names_untouched() -> None:
+    names = ["short#0", "j1"]
+    assert _truncate_for_gams_uel(names, limit=63) == names
+
+
+def test_build_direct_default_naming_unaffected_by_explicit_coordinate_names_support(
+    simple_model: Model,
+) -> None:
+    """The default (off) path's Set records must stay exactly `j{k}`/`i{k}`."""
+    solver = GAMS.from_model(simple_model, io_api="direct")
+    cont = solver.solver_model.container
+    assert cont["j"].records["uni"].tolist() == ["j0", "j1"]
+
+
+def test_solve_with_explicit_coordinate_names() -> None:
+    m = Model(chunk=None)
+    idx = pd.Index(["plantA", "plantB", "plantC"], name="plant")
+    x = m.add_variables(lower=0, upper=10, coords=[idx], name="production")
+    m.add_constraints(x.sum() >= 5, name="demand")
+    m.add_constraints(x >= 1, name="minrun")
+    m.add_objective((x * 2).sum())
+
+    solver = GAMS.from_model(m, io_api="direct", explicit_coordinate_names=True)
+    cont = solver.solver_model.container
+    j_keys = cont["j"].records["uni"].tolist()
+    assert any("production" in key for key in j_keys)
+    assert j_keys != ["j0", "j1", "j2"]
+
+    status, condition = m.solve("gams", explicit_coordinate_names=True)
+    assert status == "ok"
+    assert condition == "optimal"
+    assert m.objective.value == pytest.approx(10.0)
+    assert x.solution.to_pandas().to_dict() == {
+        "plantA": 3.0,
+        "plantB": 1.0,
+        "plantC": 1.0,
+    }
+
+
+def test_solve_with_explicit_coordinate_names_matches_default() -> None:
+    def build() -> tuple[Model, Variable]:
+        m = Model(chunk=None)
+        idx = pd.Index(["plantA", "plantB", "plantC"], name="plant")
+        x = m.add_variables(lower=0, upper=10, coords=[idx], name="production")
+        m.add_constraints(x.sum() >= 5, name="demand")
+        m.add_constraints(x >= 1, name="minrun")
+        m.add_objective((x * 2).sum())
+        return m, x
+
+    m_off, x_off = build()
+    m_off.solve("gams")
+    m_on, x_on = build()
+    m_on.solve("gams", explicit_coordinate_names=True)
+
+    assert m_off.objective.value == pytest.approx(m_on.objective.value)
+    assert x_off.solution.values == pytest.approx(x_on.solution.values)
+
+
+def test_solve_with_explicit_coordinate_names_truncates_long_coordinates() -> None:
+    """Names exceeding GAMS's 63-char UEL limit must still solve correctly."""
+    long_names = [f"a_very_long_descriptive_coordinate_name_{i}" * 3 for i in range(3)]
+    idx = pd.Index(long_names, name="plant")
+
+    m = Model(chunk=None)
+    x = m.add_variables(lower=0, upper=10, coords=[idx], name="production")
+    m.add_constraints(x.sum() >= 5, name="demand")
+    m.add_constraints(x >= 1, name="minrun")
+    m.add_objective((x * 2).sum())
+
+    status, condition = m.solve("gams", explicit_coordinate_names=True)
+    assert status == "ok"
+    assert condition == "optimal"
+    assert m.objective.value == pytest.approx(10.0)
