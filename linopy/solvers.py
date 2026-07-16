@@ -3835,6 +3835,7 @@ class GAMS(Solver["gamspy.Container | None"]):
             SolverFeature.INTEGER_VARIABLES,
             SolverFeature.SOS_CONSTRAINTS,
             SolverFeature.SEMI_CONTINUOUS_VARIABLES,
+            SolverFeature.QUADRATIC_OBJECTIVE,
             SolverFeature.DIRECT_API,
             SolverFeature.SOLUTION_FILE_NOT_NEEDED,
         }
@@ -3849,10 +3850,17 @@ class GAMS(Solver["gamspy.Container | None"]):
     def _license_probe(cls) -> None:
         """Build+solve the smallest possible scalar LP as a real license round trip."""
         cont = gamspy.Container()
-        x = gamspy.Variable(cont, name="x", type="free")
-        eq = gamspy.Equation(cont, name="eq")
+        x = gamspy.Variable(cont, name="x", type="free", description="dummy scalar variable")
+        eq = gamspy.Equation(cont, name="eq", description="dummy fixing equation")
         eq[...] = x == 1
-        m = gamspy.Model(cont, name="m", problem="lp", sense="min", objective=x, equations=[eq])
+        m = gamspy.Model(
+            cont,
+            name="m",
+            problem="lp",
+            sense="min",
+            objective=x,
+            equations=[eq],
+        )
         m.solve(output=None)
 
     def _build(self, **build_kwargs: Any) -> None:
@@ -3907,34 +3915,51 @@ class GAMS(Solver["gamspy.Container | None"]):
         n = len(M.vlabels)
         n_cons = len(M.clabels) if M.A is not None else 0
 
+        # Built once and reused everywhere below instead of re-formatting
+        # "j{k}"/"i{k}" per occurrence — a real cost at large n (confirmed via
+        # profiling, not just guessed): re-formatting labels_j independently
+        # for lb_full/ub_full/c_full/subsets/matrix records cost ~25% of
+        # total build time on a 300k-variable/1.5M-nonzero model.
+        labels_j = [f"j{k}" for k in range(n)]
+
         cont = gamspy.Container()
-        j = gamspy.Set(cont, name="j", records=[f"j{k}" for k in range(n)])
+        j = gamspy.Set(
+            cont, name="j", records=labels_j, description="positions of all variables"
+        )
         lb_full = gamspy.Parameter(
             cont,
             name="lb_full",
             domain=[j],
-            records=[(f"j{k}", float(v)) for k, v in enumerate(M.lb)],
+            records=list(zip(labels_j, M.lb.astype(float))),
+            description="lower bound by variable position",
         )
         ub_full = gamspy.Parameter(
             cont,
             name="ub_full",
             domain=[j],
-            records=[(f"j{k}", float(v)) for k, v in enumerate(M.ub)],
+            records=list(zip(labels_j, M.ub.astype(float))),
+            description="upper bound by variable position",
         )
         c_full = gamspy.Parameter(
             cont,
             name="c_full",
             domain=[j],
-            records=[(f"j{k}", float(v)) for k, v in enumerate(M.c)],
+            records=list(zip(labels_j, M.c.astype(float))),
+            description="objective coefficient by variable position",
         )
 
         sos_groups = list(_iter_sos_sets(model))
-        sos_positions: set[int] = set()
-        for _, positions, _ in sos_groups:
-            sos_positions.update(int(p) for p in positions)
+        if M.Q is not None and sos_groups:
+            raise NotImplementedError(
+                "The GAMS backend does not yet support combining a quadratic "
+                "objective with SOS constraints."
+            )
         is_sos = np.zeros(n, dtype=bool)
-        if sos_positions:
-            is_sos[list(sos_positions)] = True
+        if sos_groups:
+            all_sos_positions = np.concatenate(
+                [positions for _, positions, _ in sos_groups]
+            )
+            is_sos[all_sos_positions.astype(int)] = True
 
         # (domain_set, variable) pairs contributing to the objective/rows.
         var_terms: list[tuple[Any, Any]] = []
@@ -3946,10 +3971,15 @@ class GAMS(Solver["gamspy.Container | None"]):
                 cont,
                 name=f"j{kind.lower()}",
                 domain=[j],
-                records=[f"j{p}" for p in positions],
+                records=[labels_j[p] for p in positions],
+                description=f"positions of {vartype} variables",
             )
             var = gamspy.Variable(
-                cont, name=f"x{kind.lower()}", type=vartype, domain=[j]
+                cont,
+                name=f"x{kind.lower()}",
+                type=vartype,
+                domain=[j],
+                description=f"{vartype} decision variables",
             )
             var.lo[sub] = lb_full[sub]
             var.up[sub] = ub_full[sub]
@@ -3958,14 +3988,17 @@ class GAMS(Solver["gamspy.Container | None"]):
         s_set = None
         if sos_groups:
             s_set = gamspy.Set(
-                cont, name="s", records=[f"s{gi}" for gi in range(len(sos_groups))]
+                cont,
+                name="s",
+                records=[f"s{gi}" for gi in range(len(sos_groups))],
+                description="SOS group identifiers",
             )
         for sos_type, set_name, var_name, vartype in (
             (1, "js1", "xs1", "sos1"),
             (2, "js2", "xs2", "sos2"),
         ):
             group_records = [
-                (f"s{gi}", f"j{int(p)}")
+                (f"s{gi}", labels_j[int(p)])
                 for gi, (t, positions, _) in enumerate(sos_groups)
                 if t == sos_type
                 for p in positions
@@ -3974,9 +4007,19 @@ class GAMS(Solver["gamspy.Container | None"]):
                 continue
             assert s_set is not None
             dom = gamspy.Set(
-                cont, name=set_name, domain=[s_set, j], records=group_records
+                cont,
+                name=set_name,
+                domain=[s_set, j],
+                records=group_records,
+                description=f"SOS{sos_type} group membership (group, position)",
             )
-            var = gamspy.Variable(cont, name=var_name, type=vartype, domain=[s_set, j])
+            var = gamspy.Variable(
+                cont,
+                name=var_name,
+                type=vartype,
+                domain=[s_set, j],
+                description=f"SOS{sos_type} decision variables",
+            )
             var.lo[dom[s_set, j]] = lb_full[j]
             var.up[dom[s_set, j]] = ub_full[j]
             var_terms.append((dom, var))
@@ -3994,32 +4037,82 @@ class GAMS(Solver["gamspy.Container | None"]):
                 return dom[s_set, j], j
             return dom, dom
 
-        obj = gamspy.Variable(cont, name="obj", type="free")
-        eobj = gamspy.Equation(cont, name="eobj")
+        obj = gamspy.Variable(
+            cont, name="obj", type="free", description="objective value"
+        )
+        eobj = gamspy.Equation(
+            cont, name="eobj", description="objective function definition"
+        )
         obj_expr: Any = 0
         for dom, var in var_terms:
             sum_dom, idx = sum_domain_and_index(dom)
             obj_expr = obj_expr + gamspy.Sum(sum_dom, c_full[idx] * var[dom])
-        eobj[...] = obj_expr == obj
         equations = [eobj]
 
+        if M.Q is not None:
+            # No SOS groups here (guarded above), so every var_terms entry is
+            # a plain per-kind subset declared over the full `j` domain —
+            # link each into one flat auxiliary variable to build a single
+            # clean sum over the full n x n quadratic term.
+            jj = gamspy.Alias(cont, name="jj", alias_with=j)
+            Qcoo = M.Q.tocoo()
+            q_full = gamspy.Parameter(
+                cont,
+                name="q_full",
+                domain=[j, jj],
+                records=[
+                    (labels_j[r], labels_j[cc], float(v))
+                    for r, cc, v in zip(Qcoo.row, Qcoo.col, Qcoo.data)
+                ],
+                description="quadratic objective coefficient by (row, col) position",
+            )
+            xq = gamspy.Variable(
+                cont,
+                name="xq",
+                type="free",
+                domain=[j],
+                description="auxiliary variable linking per-kind variables for the quadratic term",
+            )
+            elink = gamspy.Equation(
+                cont,
+                name="elink",
+                domain=[j],
+                description="links xq to the real per-kind variable at each position",
+            )
+            for dom, var in var_terms:
+                elink[dom] = xq[dom] == var[dom]
+            equations.append(elink)
+            obj_expr = obj_expr + 0.5 * gamspy.Sum(
+                (j, jj), q_full[j, jj] * xq[j] * xq[jj]
+            )
+
+        eobj[...] = obj_expr == obj
+
         if M.A is not None and n_cons:
-            i = gamspy.Set(cont, name="i", records=[f"i{k}" for k in range(n_cons)])
+            labels_i = [f"i{k}" for k in range(n_cons)]
+            i = gamspy.Set(
+                cont,
+                name="i",
+                records=labels_i,
+                description="positions of all constraint rows",
+            )
             Acoo = M.A.tocoo()
             a = gamspy.Parameter(
                 cont,
                 name="a",
                 domain=[i, j],
                 records=[
-                    (f"i{r}", f"j{cc}", float(v))
+                    (labels_i[r], labels_j[cc], float(v))
                     for r, cc, v in zip(Acoo.row, Acoo.col, Acoo.data)
                 ],
+                description="constraint matrix coefficient by (row, col) position",
             )
             b_par = gamspy.Parameter(
                 cont,
                 name="b_par",
                 domain=[i],
-                records=[(f"i{k}", float(v)) for k, v in enumerate(M.b)],
+                records=list(zip(labels_i, M.b.astype(float))),
+                description="constraint right-hand side by row position",
             )
             for sense, set_name, eq_name, op in (
                 (">", "ig", "eg", "__ge__"),
@@ -4033,7 +4126,8 @@ class GAMS(Solver["gamspy.Container | None"]):
                     cont,
                     name=set_name,
                     domain=[i],
-                    records=[f"i{p}" for p in positions],
+                    records=[labels_i[p] for p in positions],
+                    description=f"row positions with sense '{sense}'",
                 )
 
                 row_expr: Any = 0
@@ -4042,18 +4136,31 @@ class GAMS(Solver["gamspy.Container | None"]):
                     row_expr = row_expr + gamspy.Sum(
                         sum_dom, a[row_set, idx] * var[dom]
                     )
-                eq = gamspy.Equation(cont, name=eq_name, domain=[i])
+                eq = gamspy.Equation(
+                    cont,
+                    name=eq_name,
+                    domain=[i],
+                    description=f"constraints with sense '{sense}'",
+                )
                 eq[row_set] = getattr(row_expr, op)(b_par[row_set])
                 equations.append(eq)
 
         is_mip = bool((M.vtypes != "C").any() or sos_groups)
+        is_qp = M.Q is not None
+        problem = {
+            (False, False): "lp",
+            (True, False): "mip",
+            (False, True): "qcp",
+            (True, True): "miqcp",
+        }[(is_mip, is_qp)]
         gams_model = gamspy.Model(
             cont,
             name="m",
-            problem="mip" if is_mip else "lp",
+            problem=problem,
             sense=model.sense,
             objective=obj,
             equations=equations,
+            description="linopy-generated model",
         )
 
         self.solver_model = gams_model
@@ -4119,7 +4226,8 @@ class GAMS(Solver["gamspy.Container | None"]):
             objective = float(objective) if objective is not None else np.nan
 
             # Decision variables/rows are the ones we declared, minus the
-            # bookkeeping symbols "obj"/"eobj" — looked up from the
+            # bookkeeping symbols "obj"/"eobj" (and, for quadratic models,
+            # the auxiliary "xq"/"elink" linking pair) — looked up from the
             # Container rather than tracked separately at build time.
             cont = m.container
             n = len(cont["j"].records)
@@ -4127,7 +4235,7 @@ class GAMS(Solver["gamspy.Container | None"]):
 
             primal = np.full(n, np.nan)
             for var in cont.getVariables():
-                if var.name == "obj":
+                if var.name in ("obj", "xq"):
                     continue
                 filled = self._scatter_by_position(var.records, "j", "level", n)
                 mask = ~np.isnan(filled)
@@ -4136,7 +4244,7 @@ class GAMS(Solver["gamspy.Container | None"]):
 
             dual_arr = np.full(n_cons, np.nan)
             for eq in cont.getEquations():
-                if eq.name == "eobj":
+                if eq.name in ("eobj", "elink"):
                     continue
                 filled = self._scatter_by_position(eq.records, "i", "marginal", n_cons)
                 mask = ~np.isnan(filled)
