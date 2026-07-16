@@ -102,6 +102,27 @@ def _names_to_labels(names: Any) -> np.ndarray:
             )
 
 
+def _truncate_for_gams_uel(names: list[str], limit: int = 63) -> list[str]:
+    """
+    Truncate the descriptive prefix of each name, preserving the exact
+    trailing ``#<label>`` suffix, so every name fits GAMS's UEL length cap.
+
+    The suffix is never touched, so uniqueness is preserved regardless of
+    how much of the prefix gets cut: two different labels always keep
+    different suffixes, even if their truncated prefixes collide.
+    """
+    out = []
+    for name in names:
+        if len(name) <= limit:
+            out.append(name)
+            continue
+        suffix_start = name.rfind("#")
+        suffix = name[suffix_start:] if suffix_start != -1 else ""
+        prefix_budget = max(0, limit - len(suffix))
+        out.append(name[:prefix_budget] + suffix)
+    return out
+
+
 def _solution_from_names(values: np.ndarray, names: Any, size: int) -> np.ndarray:
     """
     Build a label-indexed dense solution array of length ``size`` from
@@ -3877,7 +3898,6 @@ class GAMS(Solver["gamspy.Container | None"]):
             "problem_fn",
             "slice_size",
             "progress",
-            "explicit_coordinate_names",
         ):
             build_kwargs.pop(key, None)
         super()._build(**build_kwargs)
@@ -3907,20 +3927,36 @@ class GAMS(Solver["gamspy.Container | None"]):
         13: "internal_solver_error",
     }
 
-    def _build_direct(self, **kwargs: Any) -> None:
+    def _build_direct(
+        self, explicit_coordinate_names: bool = False, **kwargs: Any
+    ) -> None:
         model = self.model
         assert model is not None
         model.constraints.sanitize_missings()
         M = model.matrices
         n = len(M.vlabels)
         n_cons = len(M.clabels) if M.A is not None else 0
+        self._explicit_coordinate_names = explicit_coordinate_names
 
         # Built once and reused everywhere below instead of re-formatting
         # "j{k}"/"i{k}" per occurrence — a real cost at large n (confirmed via
         # profiling, not just guessed): re-formatting labels_j independently
         # for lb_full/ub_full/c_full/subsets/matrix records cost ~25% of
         # total build time on a 300k-variable/1.5M-nonzero model.
-        labels_j = [f"j{k}" for k in range(n)]
+        #
+        # explicit_coordinate_names swaps these for descriptive names (the
+        # same "name(coord)#label" scheme Gurobi/Highs use, reused verbatim
+        # via get_printers_scalar) truncated to GAMS's 63-char UEL limit —
+        # the '#<label>' suffix is never truncated away, so _names_to_labels
+        # can still recover the original position/label after solving.
+        print_constraints = None
+        if explicit_coordinate_names:
+            print_variables, print_constraints = linopy.io.get_printers_scalar(
+                model, explicit_coordinate_names=True
+            )
+            labels_j = _truncate_for_gams_uel(print_variables(M.vlabels))
+        else:
+            labels_j = [f"j{k}" for k in range(n)]
 
         cont = gamspy.Container()
         j = gamspy.Set(
@@ -4089,7 +4125,10 @@ class GAMS(Solver["gamspy.Container | None"]):
         eobj[...] = obj_expr == obj
 
         if M.A is not None and n_cons:
-            labels_i = [f"i{k}" for k in range(n_cons)]
+            if print_constraints is not None:
+                labels_i = _truncate_for_gams_uel(print_constraints(M.clabels))
+            else:
+                labels_i = [f"i{k}" for k in range(n_cons)]
             i = gamspy.Set(
                 cont,
                 name="i",
@@ -4230,26 +4269,54 @@ class GAMS(Solver["gamspy.Container | None"]):
             # the auxiliary "xq"/"elink" linking pair) — looked up from the
             # Container rather than tracked separately at build time.
             cont = m.container
-            n = len(cont["j"].records)
-            n_cons = len(cont["i"].records) if "i" in cont.data else 0
 
-            primal = np.full(n, np.nan)
-            for var in cont.getVariables():
-                if var.name in ("obj", "xq"):
-                    continue
-                filled = self._scatter_by_position(var.records, "j", "level", n)
-                mask = ~np.isnan(filled)
-                primal[mask] = filled[mask]
-            sol = _solution_from_labels(primal, self._vlabels, self._n_vars)
+            if self._explicit_coordinate_names:
+                # Element keys are descriptive names ("name(coord)#label"),
+                # not positions — scatter straight into label-space via the
+                # same shared utility Gurobi/Highs's from-file paths use,
+                # instead of _scatter_by_position's position-based parsing.
+                sol = np.full(self._n_vars, np.nan)
+                for var in cont.getVariables():
+                    if var.name in ("obj", "xq") or var.records.empty:
+                        continue
+                    filled = _solution_from_names(
+                        var.records["level"].to_numpy(), var.records["j"], self._n_vars
+                    )
+                    mask = ~np.isnan(filled)
+                    sol[mask] = filled[mask]
 
-            dual_arr = np.full(n_cons, np.nan)
-            for eq in cont.getEquations():
-                if eq.name in ("eobj", "elink"):
-                    continue
-                filled = self._scatter_by_position(eq.records, "i", "marginal", n_cons)
-                mask = ~np.isnan(filled)
-                dual_arr[mask] = filled[mask]
-            dual = _solution_from_labels(dual_arr, self._clabels, self._n_cons)
+                dual = np.full(self._n_cons, np.nan)
+                for eq in cont.getEquations():
+                    if eq.name in ("eobj", "elink") or eq.records.empty:
+                        continue
+                    filled = _solution_from_names(
+                        eq.records["marginal"].to_numpy(), eq.records["i"], self._n_cons
+                    )
+                    mask = ~np.isnan(filled)
+                    dual[mask] = filled[mask]
+            else:
+                n = len(cont["j"].records)
+                n_cons = len(cont["i"].records) if "i" in cont.data else 0
+
+                primal = np.full(n, np.nan)
+                for var in cont.getVariables():
+                    if var.name in ("obj", "xq"):
+                        continue
+                    filled = self._scatter_by_position(var.records, "j", "level", n)
+                    mask = ~np.isnan(filled)
+                    primal[mask] = filled[mask]
+                sol = _solution_from_labels(primal, self._vlabels, self._n_vars)
+
+                dual_arr = np.full(n_cons, np.nan)
+                for eq in cont.getEquations():
+                    if eq.name in ("eobj", "elink"):
+                        continue
+                    filled = self._scatter_by_position(
+                        eq.records, "i", "marginal", n_cons
+                    )
+                    mask = ~np.isnan(filled)
+                    dual_arr[mask] = filled[mask]
+                dual = _solution_from_labels(dual_arr, self._clabels, self._n_cons)
 
             return Solution(sol, dual, objective)
 
