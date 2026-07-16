@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -185,15 +188,141 @@ def test_solve_miqp() -> None:
     assert (y.solution.values == 0.0).all()
 
 
-def test_solve_qp_with_sos_not_supported() -> None:
+def test_solve_sos1_with_quadratic_objective() -> None:
+    m = Model(chunk=None)
+    idx = pd.Index([0, 1, 2], name="i")
+    x = m.add_variables(lower=0, upper=1, coords=[idx], name="x")
+    m.add_sos_constraints(x, sos_type=1, sos_dim="i")
+    a = xr.DataArray([0.1, 0.2, 5.0], coords=[idx], dims=["i"])
+    # x^2 - 2*a*x is minimized (unconstrained) at x=a; SOS1 forces all but
+    # one entry to 0, so the optimum picks whichever single index reduces
+    # the objective the most -- here index 2 (a=5, clipped to the upper
+    # bound of 1) by a wide, untied margin.
+    m.add_objective((x * x - 2 * a * x).sum())
+
+    solver = GAMS.from_model(m, io_api="direct")
+    assert solver.solver_model.problem.name.lower() == "miqcp"
+
+    status, condition = m.solve("gams")
+    assert status == "ok"
+    # GAMS reports MINLP-class incumbents (model status 8, "Integer
+    # Solution") as "suboptimal" even when the B&B gap closes to zero --
+    # it never claims global optimality for a nonlinear-branching solve.
+    # The GAMS log for this solve shows "Best possible: -9.0000" exactly
+    # matching the incumbent with a 0.000000 gap, confirming the answer
+    # below is in fact exactly optimal despite the reported condition.
+    assert condition == "suboptimal"
+    assert m.objective.value == pytest.approx(-9.0)
+    solution = x.solution.values
+    assert np.count_nonzero(solution) == 1
+    assert solution[2] == pytest.approx(1.0)
+
+
+def test_solve_sos2_with_quadratic_objective() -> None:
     m = Model(chunk=None)
     idx = pd.Index([0, 1, 2, 3], name="i")
+    x = m.add_variables(lower=0, upper=1, coords=[idx], name="x")
+    m.add_sos_constraints(x, sos_type=2, sos_dim="i")
+    a = xr.DataArray([6.0, 0.1, 0.1, 5.0], coords=[idx], dims=["i"])
+    # SOS2 permits two *adjacent* nonzero entries. The two largest `a`
+    # values (indices 0 and 3) are not adjacent, so this also exercises
+    # that the adjacency rule -- not just "pick the two best" -- is
+    # actually enforced: the best *adjacent* pair is (0, 1).
+    m.add_objective((x * x - 2 * a * x).sum())
+
+    status, condition = m.solve("gams")
+    assert status == "ok"
+    # Same GAMS MINLP-status convention as test_solve_sos1_with_quadratic_objective.
+    assert condition == "suboptimal"
+    assert m.objective.value == pytest.approx(-11.01)
+    solution = x.solution.values
+    assert np.count_nonzero(solution) == 2
+    assert solution[0] == pytest.approx(1.0)
+    assert solution[1] == pytest.approx(0.1)
+    assert solution[2] == pytest.approx(0.0)
+    assert solution[3] == pytest.approx(0.0)
+
+
+def test_solve_combined_sos1_sos2_continuous_with_quadratic_objective() -> None:
+    m = Model(chunk=None)
+
+    idx1 = pd.Index([0, 1, 2], name="i1")
+    x1 = m.add_variables(lower=0, upper=1, coords=[idx1], name="x1")
+    m.add_sos_constraints(x1, sos_type=1, sos_dim="i1")
+    a1 = xr.DataArray([0.1, 0.2, 5.0], coords=[idx1], dims=["i1"])
+
+    idx2 = pd.Index([0, 1, 2, 3], name="i2")
+    x2 = m.add_variables(lower=0, upper=1, coords=[idx2], name="x2")
+    m.add_sos_constraints(x2, sos_type=2, sos_dim="i2")
+    a2 = xr.DataArray([6.0, 0.1, 0.1, 5.0], coords=[idx2], dims=["i2"])
+
+    y = m.add_variables(lower=0, upper=2, name="y")
+    # Non-binding at the optimum (x1 sums to 1 and y to 2), but exercises
+    # SOS + plain-continuous + quadratic all contributing to one constraint.
+    m.add_constraints(x1.sum() + y >= 1, name="link")
+
+    m.add_objective(
+        (x1 * x1 - 2 * a1 * x1).sum()
+        + (x2 * x2 - 2 * a2 * x2).sum()
+        + (y * y - 2 * 3 * y)
+    )
+
+    solver = GAMS.from_model(m, io_api="direct")
+    assert solver.solver_model.problem.name.lower() == "miqcp"
+
+    status, condition = m.solve("gams")
+    assert status == "ok"
+    # Same GAMS MINLP-status convention as test_solve_sos1_with_quadratic_objective.
+    assert condition == "suboptimal"
+    # The objective separates additively across x1/x2/y with only a
+    # non-binding shared constraint, so the global optimum is the sum of
+    # each group's independent optimum computed in the tests above
+    # (-9.0, -11.01) plus y clipped to its upper bound of 2: 4 - 12 = -8.
+    assert m.objective.value == pytest.approx(-9.0 - 11.01 - 8.0)
+
+    sol1 = x1.solution.values
+    assert np.count_nonzero(sol1) == 1
+    assert sol1[2] == pytest.approx(1.0)
+
+    sol2 = x2.solution.values
+    assert np.count_nonzero(sol2) == 2
+    assert sol2[0] == pytest.approx(1.0)
+    assert sol2[1] == pytest.approx(0.1)
+
+    assert float(y.solution) == pytest.approx(2.0)
+
+
+def test_sos_quadratic_linking_equations_reference_only_own_member(
+    tmp_path: Path,
+) -> None:
+    """
+    Regression guard for the exact bug this feature's design caught: a
+    naive ``Sum(dom[s_set, j], ...)`` linking equation summed every row
+    over the *entire* SOS group instead of each row's own member. Checking
+    only final solved values could pass by coincidence on a symmetric toy
+    model, so this inspects the actual compiled GAMS equation text.
+    """
+    m = Model(chunk=None)
+    idx = pd.Index([0, 1], name="i")
     x = m.add_variables(lower=0, upper=1, coords=[idx], name="x")
     m.add_sos_constraints(x, sos_type=1, sos_dim="i")
     m.add_objective((x * x).sum())
 
-    with pytest.raises(NotImplementedError, match="SOS constraints"):
-        m.solve("gams")
+    listing_fn = tmp_path / "listing.lst"
+    m.solve(
+        "gams",
+        listing_file=str(listing_fn),
+        variable_listing_limit=-1,
+        equation_listing_limit=-1,
+    )
+    listing = listing_fn.read_text()
+
+    rows = re.findall(r"elink_xs1\(j\d+\)\.\.(.*?);", listing)
+    assert rows, "elink_xs1 equations not found in the GAMS listing"
+    for row in rows:
+        # Each row must reference exactly one xs1(...) term -- its own
+        # position's SOS member, not the whole group.
+        assert row.count("xs1(") == 1, f"row references more than one member: {row}"
 
 
 def test_truncate_for_gams_uel_preserves_suffix_and_uniqueness() -> None:
