@@ -4209,7 +4209,7 @@ class GAMS(Solver["gamspy.Container | None"]):
         # when actually in use, matching the `has_ig`/`has_il`/... flags
         # computed above.
         eobj = gamspy.Equation(cont, name="eobj", description="objective function")
-        eg = (
+        eg: Any = (
             gamspy.Equation(
                 cont,
                 name="eg",
@@ -4219,14 +4219,14 @@ class GAMS(Solver["gamspy.Container | None"]):
             if has_ig
             else None
         )
-        el = (
+        el: Any = (
             gamspy.Equation(
                 cont, name="el", domain=[i], description="less-than-or equal equations"
             )
             if has_il
             else None
         )
-        ee = (
+        ee: Any = (
             gamspy.Equation(
                 cont, name="ee", domain=[i], description="equality equations"
             )
@@ -4238,7 +4238,7 @@ class GAMS(Solver["gamspy.Container | None"]):
         obj = gamspy.Variable(
             cont, name="obj", type="free", description="objective variable"
         )
-        xc = (
+        xc: Any = (
             gamspy.Variable(
                 cont,
                 name="xc",
@@ -4249,7 +4249,7 @@ class GAMS(Solver["gamspy.Container | None"]):
             if has_jc
             else None
         )
-        xb = (
+        xb: Any = (
             gamspy.Variable(
                 cont,
                 name="xb",
@@ -4260,7 +4260,7 @@ class GAMS(Solver["gamspy.Container | None"]):
             if has_jb
             else None
         )
-        xi = (
+        xi: Any = (
             gamspy.Variable(
                 cont,
                 name="xi",
@@ -4271,7 +4271,7 @@ class GAMS(Solver["gamspy.Container | None"]):
             if has_ji
             else None
         )
-        xsc = (
+        xsc: Any = (
             gamspy.Variable(
                 cont,
                 name="xsc",
@@ -4282,7 +4282,7 @@ class GAMS(Solver["gamspy.Container | None"]):
             if has_jsc
             else None
         )
-        xs1 = (
+        xs1: Any = (
             gamspy.Variable(
                 cont,
                 name="xs1",
@@ -4293,7 +4293,7 @@ class GAMS(Solver["gamspy.Container | None"]):
             if has_sos1
             else None
         )
-        xs2 = (
+        xs2: Any = (
             gamspy.Variable(
                 cont,
                 name="xs2",
@@ -4306,53 +4306,41 @@ class GAMS(Solver["gamspy.Container | None"]):
         )
 
         if has_jc:
-            assert xc is not None
             xc.lo[jc] = lo[jc]
             xc.up[jc] = up[jc]
         if has_jb:
-            assert xb is not None
             xb.lo[jb] = lo[jb]
             xb.up[jb] = up[jb]
         if has_ji:
-            assert xi is not None
             xi.lo[ji] = lo[ji]
             xi.up[ji] = up[ji]
         if has_jsc:
-            assert xsc is not None
             xsc.lo[jsc] = lo[jsc]
             xsc.up[jsc] = up[jsc]
         if has_sos1:
-            assert xs1 is not None
             xs1.lo[js1[s, j]] = lo[j]
             xs1.up[js1[s, j]] = up[j]
         if has_sos2:
-            assert xs2 is not None
             xs2.lo[js2[s, j]] = lo[j]
             xs2.up[js2[s, j]] = up[j]
 
         def _obj_expr() -> Any:
             expr: Any = None
             if has_jc:
-                assert xc is not None
                 expr = gamspy.Sum(jc, c[jc] * xc[jc])
             if has_jb:
-                assert xb is not None
                 term = gamspy.Sum(jb, c[jb] * xb[jb])
                 expr = term if expr is None else expr + term
             if has_ji:
-                assert xi is not None
                 term = gamspy.Sum(ji, c[ji] * xi[ji])
                 expr = term if expr is None else expr + term
             if has_jsc:
-                assert xsc is not None
                 term = gamspy.Sum(jsc, c[jsc] * xsc[jsc])
                 expr = term if expr is None else expr + term
             if has_sos1:
-                assert xs1 is not None
                 term = gamspy.Sum(js1[s, j], c[j] * xs1[js1])
                 expr = term if expr is None else expr + term
             if has_sos2:
-                assert xs2 is not None
                 term = gamspy.Sum(js2[s, j], c[j] * xs2[js2])
                 expr = term if expr is None else expr + term
             return expr
@@ -4360,39 +4348,30 @@ class GAMS(Solver["gamspy.Container | None"]):
         def _row_expr(row: Any) -> Any:
             expr: Any = None
             if has_jc:
-                assert xc is not None
                 expr = gamspy.Sum(jc, ac[row, jc] * xc[jc])
             if has_jb:
-                assert xb is not None
                 term = gamspy.Sum(jb, ab[row, jb] * xb[jb])
                 expr = term if expr is None else expr + term
             if has_ji:
-                assert xi is not None
                 term = gamspy.Sum(ji, ai[row, ji] * xi[ji])
                 expr = term if expr is None else expr + term
             if has_jsc:
-                assert xsc is not None
                 term = gamspy.Sum(jsc, asc[row, jsc] * xsc[jsc])
                 expr = term if expr is None else expr + term
             if has_sos1:
-                assert xs1 is not None
                 term = gamspy.Sum(js1, as1[row, js1] * xs1[js1])
                 expr = term if expr is None else expr + term
             if has_sos2:
-                assert xs2 is not None
                 term = gamspy.Sum(js2, as2[row, js2] * xs2[js2])
                 expr = term if expr is None else expr + term
             return expr
 
         eobj[...] = _obj_expr() + cobj == obj
         if has_ig:
-            assert eg is not None
             eg[ig] = _row_expr(ig) >= b[ig]
         if has_il:
-            assert el is not None
             el[il] = _row_expr(il) <= b[il]
         if has_ie:
-            assert ee is not None
             ee[ie] = _row_expr(ie) == b[ie]
 
         m = gamspy.Model(
