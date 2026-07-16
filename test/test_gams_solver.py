@@ -140,3 +140,52 @@ def test_solve_sos2() -> None:
     assert np.count_nonzero(solution) == 2
     assert solution[2] == pytest.approx(1.0)
     assert solution[3] == pytest.approx(1.0)
+
+
+def test_solve_qp() -> None:
+    m = Model(chunk=None)
+    lower = pd.Series(0, range(3))
+    x = m.add_variables(lower, name="x")
+    y = m.add_variables(lower, name="y")
+    m.add_constraints(x + y >= 10)
+    m.add_objective(x * x - 2 * x + y)
+
+    solver = GAMS.from_model(m, io_api="direct")
+    assert solver.solver_model.problem.name.lower() == "qcp"
+
+    status, condition = m.solve("gams")
+    assert status == "ok"
+    assert condition == "optimal"
+    assert m.objective.value == pytest.approx(23.25)
+    assert x.solution.values == pytest.approx([1.5, 1.5, 1.5])
+    assert y.solution.values == pytest.approx([8.5, 8.5, 8.5])
+
+
+def test_solve_miqp() -> None:
+    m = Model(chunk=None)
+    idx = pd.RangeIndex(3, name="i")
+    x = m.add_variables(coords=[idx], name="x", binary=True)
+    y = m.add_variables(lower=0, coords=[idx], name="y")
+    m.add_constraints(x + y >= 1)
+    m.add_objective((x * x - 3 * x + y).sum())
+
+    solver = GAMS.from_model(m, io_api="direct")
+    assert solver.solver_model.problem.name.lower() == "miqcp"
+
+    status, condition = m.solve("gams")
+    assert status == "ok"
+    assert condition == "optimal"
+    assert m.objective.value == pytest.approx(-6.0)
+    assert (x.solution.values == 1.0).all()
+    assert (y.solution.values == 0.0).all()
+
+
+def test_solve_qp_with_sos_not_supported() -> None:
+    m = Model(chunk=None)
+    idx = pd.Index([0, 1, 2, 3], name="i")
+    x = m.add_variables(lower=0, upper=1, coords=[idx], name="x")
+    m.add_sos_constraints(x, sos_type=1, sos_dim="i")
+    m.add_objective((x * x).sum())
+
+    with pytest.raises(NotImplementedError, match="SOS constraints"):
+        m.solve("gams")
