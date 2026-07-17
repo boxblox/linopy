@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 import numpy as np
@@ -11,7 +10,7 @@ import pandas as pd
 import pytest
 import xarray as xr
 
-from linopy import GREATER_EQUAL, Model, Variable, solvers
+from linopy import EQUAL, GREATER_EQUAL, LESS_EQUAL, Model, Variable, solvers
 from linopy.constants import TerminationCondition
 from linopy.solvers import (
     GAMS,
@@ -76,6 +75,90 @@ def test_status_mapping(solve_stat: int, model_stat: int, expected: str) -> None
     assert termination == expected
 
 
+def test_solve_infeasible() -> None:
+    """A real infeasible solve, not just the status-code dict lookup."""
+    m = Model(chunk=None)
+    x = m.add_variables(lower=0, name="x")
+    m.add_constraints(x, GREATER_EQUAL, 5, name="lo")
+    m.add_constraints(x, LESS_EQUAL, 2, name="hi")
+    m.add_objective(x)
+
+    status, condition = m.solve("gams")
+    assert status == "warning"
+    assert condition == "infeasible"
+
+
+def test_solve_unbounded() -> None:
+    """
+    A real unbounded solve. CPLEX (the default GAMS sub-solver here) reports
+    this degenerate case as "infeasible or unbounded" without disambiguating
+    (mapped to "infeasible" per `_MODEL_STAT_MAP`), so HiGHS -- which
+    diagnoses it cleanly -- is used instead.
+    """
+    m = Model(chunk=None)
+    y = m.add_variables(lower=0, name="y")
+    m.add_constraints(y, GREATER_EQUAL, 1, name="lo")
+    m.add_objective(-y)
+
+    status, condition = m.solve("gams", solver="highs")
+    assert status == "warning"
+    assert condition == "unbounded"
+
+
+def test_indicator_constraints_not_supported() -> None:
+    """
+    `SolverFeature.INDICATOR_CONSTRAINTS` is not in `GAMS.features`, so
+    `Solver._validate_model` should reject a model with one before ever
+    reaching `_build_direct`.
+    """
+    m = Model(chunk=None)
+    b = m.add_variables(binary=True, name="b")
+    x = m.add_variables(lower=0, upper=10, name="x")
+    m.add_indicator_constraints(b, 1, x, ">=", 5, name="ind1")
+    m.add_objective(x)
+
+    with pytest.raises(ValueError, match="indicator constraints"):
+        GAMS.from_model(m, io_api="direct")
+
+
+def test_solve_log_fn_writes_to_file(tmp_path: Path) -> None:
+    log_fn = tmp_path / "solve.log"
+    m = Model(chunk=None)
+    x = m.add_variables(lower=0, name="x")
+    y = m.add_variables(lower=0, name="y")
+    m.add_constraints(x + y, GREATER_EQUAL, 4, name="c1")
+    m.add_objective(x + 2 * y)
+
+    status, condition = m.solve("gams", log_fn=str(log_fn))
+    assert status == "ok"
+    assert condition == "optimal"
+    assert log_fn.exists()
+    assert "GAMS" in log_fn.read_text()
+
+
+def test_solve_accepts_warmstart_and_basis_fn_as_noop(tmp_path: Path) -> None:
+    """
+    `warmstart_fn`/`basis_fn` are accepted for interface compatibility with
+    other solvers but silently ignored by this backend -- passing them
+    (even pointing at files that don't exist) must not raise or otherwise
+    change the solve.
+    """
+    m = Model(chunk=None)
+    x = m.add_variables(lower=0, name="x")
+    y = m.add_variables(lower=0, name="y")
+    m.add_constraints(x + y, GREATER_EQUAL, 4, name="c1")
+    m.add_objective(x + 2 * y)
+
+    status, condition = m.solve(
+        "gams",
+        warmstart_fn=str(tmp_path / "warmstart.gdx"),
+        basis_fn=str(tmp_path / "basis.gdx"),
+    )
+    assert status == "ok"
+    assert condition == "optimal"
+    assert m.objective.value == pytest.approx(4.0)
+
+
 def test_build_direct_creates_expected_symbols(simple_model: Model) -> None:
     solver = GAMS.from_model(simple_model, io_api="direct")
     cont = solver.solver_model.container
@@ -108,6 +191,49 @@ def test_solve_mip() -> None:
     assert m.objective.value == pytest.approx(2.0)
     assert float(y.solution) in (0.0, 1.0)
     assert float(b.solution) == pytest.approx(round(float(b.solution)))
+
+
+def test_solve_mixed_constraint_senses_and_duals() -> None:
+    """
+    Every other test in this file only ever uses `>=` (and, incidentally,
+    `==` via test_solve_mip) -- `<=` (the `el` equation block in
+    `_build_direct`) is otherwise never exercised by any test. This also
+    covers dual/marginal value extraction, which no other test checks.
+    """
+    m = Model(chunk=None)
+    x = m.add_variables(lower=0, name="x")
+    y = m.add_variables(lower=0, name="y")
+    c1 = m.add_constraints(x + y, GREATER_EQUAL, 4, name="c1")
+    c2 = m.add_constraints(2 * x + y, LESS_EQUAL, 10, name="c2")
+    c3 = m.add_constraints(x - y, EQUAL, 1, name="c3")
+    m.add_objective(x + 2 * y)
+
+    status, condition = m.solve("gams")
+    assert status == "ok"
+    assert condition == "optimal"
+    assert m.objective.value == pytest.approx(5.5)
+    assert float(x.solution) == pytest.approx(2.5)
+    assert float(y.solution) == pytest.approx(1.5)
+    # c1 (>=) and c3 (=) bind at the optimum, c2 (<=) has slack.
+    assert float(c1.dual) == pytest.approx(1.5)
+    assert float(c2.dual) == pytest.approx(0.0)
+    assert float(c3.dual) == pytest.approx(-0.5)
+
+
+def test_solve_max_sense() -> None:
+    """Every other test minimizes -- this exercises `sense="max"`."""
+    m = Model(chunk=None)
+    x = m.add_variables(lower=0, upper=3, name="x")
+    y = m.add_variables(lower=0, upper=3, name="y")
+    m.add_constraints(x + y, LESS_EQUAL, 4, name="capacity")
+    m.add_objective(3 * x + 2 * y, sense="max")
+
+    status, condition = m.solve("gams")
+    assert status == "ok"
+    assert condition == "optimal"
+    assert m.objective.value == pytest.approx(11.0)
+    assert float(x.solution) == pytest.approx(3.0)
+    assert float(y.solution) == pytest.approx(1.0)
 
 
 def test_solve_sos1() -> None:
@@ -148,6 +274,30 @@ def test_solve_sos2() -> None:
     assert np.count_nonzero(solution) == 2
     assert solution[2] == pytest.approx(1.0)
     assert solution[3] == pytest.approx(1.0)
+
+
+def test_solve_semi_continuous() -> None:
+    """
+    `SolverFeature.SEMI_CONTINUOUS_VARIABLES` is declared but had no solve
+    coverage. `x` is semi-continuous in [5, 20] (either 0 or >= 5) and
+    cheaper per unit than `y`; a plain continuous relaxation would set
+    x=3 (the exact demand), which is invalid for a semi-continuous
+    variable, forcing the solver to choose between x=5 (paying for 2 unused
+    units, still cheaper) or x=0 (falling back to the pricier y) -- x=5
+    wins.
+    """
+    m = Model(chunk=None)
+    x = m.add_variables(lower=5, upper=20, semi_continuous=True, name="x")
+    y = m.add_variables(lower=0, upper=100, name="y")
+    m.add_constraints(x + y, GREATER_EQUAL, 3, name="demand")
+    m.add_objective(1 * x + 3 * y)
+
+    status, condition = m.solve("gams")
+    assert status == "ok"
+    assert condition == "optimal"
+    assert m.objective.value == pytest.approx(5.0)
+    assert float(x.solution) == pytest.approx(5.0)
+    assert float(y.solution) == pytest.approx(0.0)
 
 
 def test_solve_qp() -> None:
@@ -292,37 +442,41 @@ def test_solve_combined_sos1_sos2_continuous_with_quadratic_objective() -> None:
     assert float(y.solution) == pytest.approx(2.0)
 
 
-def test_sos_quadratic_linking_equations_reference_only_own_member(
-    tmp_path: Path,
-) -> None:
+def test_quadratic_objective_sos_cross_term_uses_only_own_pair() -> None:
     """
-    Regression guard for the exact bug this feature's design caught: a
-    naive ``Sum(dom[s_set, j], ...)`` linking equation summed every row
-    over the *entire* SOS group instead of each row's own member. Checking
-    only final solved values could pass by coincidence on a symmetric toy
-    model, so this inspects the actual compiled GAMS equation text.
+    The quadratic objective is built as one flat ``qobj[j,jj]`` parameter
+    with per-type-pair ``Domain``/``.where`` blocks (see
+    ``GAMS._build_direct``'s ``_quad_obj_expr``), not through a separate
+    per-position linking equation -- so this isn't a regression guard for
+    the old linking-equation domain-shadowing bug (there's no outer free
+    index left for a nested Sum to shadow), but it does exercise a genuine
+    *off-diagonal* SOS-SOS quadratic cross term end-to-end, which none of
+    the other quadratic+SOS tests do (they only square each element
+    in-place, i.e. diagonal-only Q entries).
     """
     m = Model(chunk=None)
-    idx = pd.Index([0, 1], name="i")
-    x = m.add_variables(lower=0, upper=1, coords=[idx], name="x")
-    m.add_sos_constraints(x, sos_type=1, sos_dim="i")
-    m.add_objective((x * x).sum())
+    idx = pd.Index([0, 1, 2], name="i")
+    x = m.add_variables(lower=0, upper=3, coords=[idx], name="x")
+    m.add_sos_constraints(x, sos_type=2, sos_dim="i")
+    # Cross terms only between *adjacent* positions (0,1) and (1,2); a bug
+    # that aggregated a position's quadratic partner over the whole SOS
+    # group (rather than the intended single position pair) would corrupt
+    # this, since only two of the three positions may be simultaneously
+    # nonzero (SOS2) -- a bogus x0*x2 contribution would generally change
+    # which adjacent pair is optimal or the resulting objective value.
+    m.add_objective((x * x.shift(i=1)).sum() - 10 * x.sum())
 
-    listing_fn = tmp_path / "listing.lst"
-    m.solve(
-        "gams",
-        listing_file=str(listing_fn),
-        variable_listing_limit=-1,
-        equation_listing_limit=-1,
-    )
-    listing = listing_fn.read_text()
-
-    rows = re.findall(r"elink_xs1\(j\d+\)\.\.(.*?);", listing)
-    assert rows, "elink_xs1 equations not found in the GAMS listing"
-    for row in rows:
-        # Each row must reference exactly one xs1(...) term -- its own
-        # position's SOS member, not the whole group.
-        assert row.count("xs1(") == 1, f"row references more than one member: {row}"
+    status, condition = m.solve("gams")
+    assert status == "ok"
+    # Global optimum: either adjacent pair maxed to its upper bound of 3,
+    # the excluded position at 0 -- t^2 - 20*t is minimized (subject to the
+    # SOS2/bound feasible region) at t=3: 9 - 60 = -51.
+    assert m.objective.value == pytest.approx(-51.0)
+    solution = x.solution.values
+    assert np.count_nonzero(solution) == 2
+    nonzero = np.flatnonzero(solution)
+    assert nonzero[1] - nonzero[0] == 1  # the two nonzero positions are adjacent
+    assert solution[nonzero] == pytest.approx([3.0, 3.0])
 
 
 def test_truncate_for_gams_uel_preserves_suffix_and_uniqueness() -> None:
