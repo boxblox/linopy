@@ -3928,11 +3928,6 @@ class GAMS(Solver["gamspy.Container | None"]):
         assert model is not None
         model.constraints.sanitize_missings()
 
-        if model.is_quadratic:
-            raise NotImplementedError(
-                "GAMS._build_direct does not yet support quadratic objectives."
-            )
-
         M = model.matrices
         n = len(M.vlabels)
         n_cons = len(M.clabels) if M.A is not None else 0
@@ -4009,7 +4004,13 @@ class GAMS(Solver["gamspy.Container | None"]):
         has_il = bool(il_mask.any())
         has_ie = bool(ie_mask.any())
         has_discrete = has_jb or has_ji or has_jsc or has_sos1 or has_sos2
-        problem = "mip" if has_discrete else "lp"
+        is_qp = M.Q is not None
+        problem = {
+            (False, False): "lp",
+            (True, False): "mip",
+            (False, True): "qcp",
+            (True, True): "miqcp",
+        }[(has_discrete, is_qp)]
 
         cont = gamspy.Container()
 
@@ -4324,6 +4325,102 @@ class GAMS(Solver["gamspy.Container | None"]):
             xs2.lo[js2[s, j]] = lo[j]
             xs2.up[js2[s, j]] = up[j]
 
+        # --- Quadratic objective (mirrors the per-type-pair Domain/.where
+        # block style of a known-correct MPS-derived gamspy reformulation
+        # (see cplex.py), adapted to a flat qobj[j,jj] parameter). Unlike
+        # that reference (whose q parameter carries extra "variable stem"
+        # tag dimensions baked into its data), M.Q is a plain
+        # position-by-position matrix with no type tags -- so each block
+        # below is scoped to the correct pair of variable-kind subsets
+        # directly (jc/jb/ji/jsc/js1/js2), rather than sharing one
+        # unrestricted (j, jj) domain across every block. Sharing an
+        # unrestricted domain with an untagged parameter would let a single
+        # nonzero Q[j,jj] entry leak into every block's identical filter,
+        # injecting spurious cross-type variable references.
+        def _quad_obj_expr() -> Any:
+            jj = gamspy.Alias(cont, name="jj", alias_with=j)
+            plain_terms: list[tuple[Any, Any]] = []
+            if has_jc:
+                plain_terms.append((jc, xc))
+            if has_jb:
+                plain_terms.append((jb, xb))
+            if has_ji:
+                plain_terms.append((ji, xi))
+            if has_jsc:
+                plain_terms.append((jsc, xsc))
+
+            sos_terms: list[tuple[Any, Any, Any]] = []
+            if has_sos1 or has_sos2:
+                ss = gamspy.Alias(cont, name="ss", alias_with=s)
+            if has_sos1:
+                jss1 = gamspy.Alias(cont, name="jss1", alias_with=js1)
+                sos_terms.append((js1, xs1, jss1))
+            if has_sos2:
+                jss2 = gamspy.Alias(cont, name="jss2", alias_with=js2)
+                sos_terms.append((js2, xs2, jss2))
+
+            assert M.Q is not None
+            Qcoo = M.Q.tocoo()
+            qobj = gamspy.Parameter(
+                cont,
+                name="qobj",
+                domain=[j, jj],
+                records=_recs(
+                    list(
+                        zip(
+                            labels_j_arr[Qcoo.row].tolist(),
+                            labels_j_arr[Qcoo.col].tolist(),
+                            Qcoo.data.tolist(),
+                        )
+                    ),
+                    3,
+                ),
+                description="quadratic objective coefficient by (position, position)",
+            )
+
+            expr: Any = 0
+            # Plain-kind diagonal (same type, both same- and cross-position
+            # terms folded into one block: jj ranges over the full type
+            # subset, including positions equal to the outer index).
+            for dom, var in plain_terms:
+                expr = expr + gamspy.Sum(
+                    gamspy.Domain(dom, jj).where[dom[jj] & qobj[dom, jj]],
+                    0.5 * qobj[dom, jj] * var[dom] * var[jj],
+                )
+            # Plain-kind cross terms: both orderings of every distinct pair.
+            for domA, varA in plain_terms:
+                for domB, varB in plain_terms:
+                    if domA is domB:
+                        continue
+                    expr = expr + gamspy.Sum(
+                        gamspy.Domain(domA, domB).where[qobj[domA, domB]],
+                        0.5 * qobj[domA, domB] * varA[domA] * varB[domB],
+                    )
+            # SOS-kind terms (diagonal and cross, both orderings): the
+            # "first" position in a block always goes through the group
+            # alias (jss1/jss2, existential index ss) and the "second"
+            # through the plain SOS set (js1/js2, existential index s) --
+            # this is what keeps a self-pair (e.g. js1-js1) from forcing the
+            # two positions' SOS group index to be equal to each other.
+            for domA, varA, aliasA in sos_terms:
+                for domB, varB, _ in sos_terms:
+                    expr = expr + gamspy.Sum(
+                        gamspy.Domain(aliasA[ss, j], domB[s, jj]).where[qobj[j, jj]],
+                        0.5 * qobj[j, jj] * varA[aliasA] * varB[domB],
+                    )
+            # Plain-SOS cross terms, both orderings.
+            for dom, var in plain_terms:
+                for domS, varS, aliasS in sos_terms:
+                    expr = expr + gamspy.Sum(
+                        gamspy.Domain(dom, domS[s, jj]).where[qobj[dom, jj]],
+                        0.5 * qobj[dom, jj] * var[dom] * varS[s, jj],
+                    )
+                    expr = expr + gamspy.Sum(
+                        gamspy.Domain(aliasS[ss, j], dom).where[qobj[j, dom]],
+                        0.5 * qobj[j, dom] * varS[aliasS] * var[dom],
+                    )
+            return expr
+
         def _obj_expr() -> Any:
             expr: Any = None
             if has_jc:
@@ -4366,7 +4463,7 @@ class GAMS(Solver["gamspy.Container | None"]):
                 expr = term if expr is None else expr + term
             return expr
 
-        eobj[...] = _obj_expr() + cobj == obj
+        eobj[...] = _obj_expr() + (_quad_obj_expr() if is_qp else 0) + cobj == obj
         if has_ig:
             eg[ig] = _row_expr(ig) >= b[ig]
         if has_il:
@@ -4446,8 +4543,7 @@ class GAMS(Solver["gamspy.Container | None"]):
             objective = float(objective) if objective is not None else np.nan
 
             # Decision variables/rows are the ones we declared, minus the
-            # bookkeeping symbols "obj"/"eobj" (and, for quadratic models,
-            # the auxiliary "xq"/"elink" linking pair) — looked up from the
+            # bookkeeping symbols "obj"/"eobj" — looked up from the
             # Container rather than tracked separately at build time.
             cont = m.container
 
@@ -4458,7 +4554,7 @@ class GAMS(Solver["gamspy.Container | None"]):
                 # instead of _scatter_by_position's position-based parsing.
                 sol = np.full(self._n_vars, np.nan)
                 for var in cont.getVariables():
-                    if var.name in ("obj", "xq") or var.records.empty:
+                    if var.name == "obj" or var.records.empty:
                         continue
                     filled = _solution_from_names(
                         var.records["level"].to_numpy(), var.records["j"], self._n_vars
@@ -4468,10 +4564,7 @@ class GAMS(Solver["gamspy.Container | None"]):
 
                 dual = np.full(self._n_cons, np.nan)
                 for eq in cont.getEquations():
-                    if (
-                        eq.name in ("eobj", "elink", "elink_xs1", "elink_xs2")
-                        or eq.records.empty
-                    ):
+                    if eq.name == "eobj" or eq.records.empty:
                         continue
                     filled = _solution_from_names(
                         eq.records["marginal"].to_numpy(), eq.records["i"], self._n_cons
@@ -4484,7 +4577,7 @@ class GAMS(Solver["gamspy.Container | None"]):
 
                 primal = np.full(n, np.nan)
                 for var in cont.getVariables():
-                    if var.name in ("obj", "xq"):
+                    if var.name == "obj":
                         continue
                     filled = self._scatter_by_position(var.records, "j", "level", n)
                     mask = ~np.isnan(filled)
@@ -4493,7 +4586,7 @@ class GAMS(Solver["gamspy.Container | None"]):
 
                 dual_arr = np.full(n_cons, np.nan)
                 for eq in cont.getEquations():
-                    if eq.name in ("eobj", "elink", "elink_xs1", "elink_xs2"):
+                    if eq.name == "eobj":
                         continue
                     filled = self._scatter_by_position(
                         eq.records, "i", "marginal", n_cons
