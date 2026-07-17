@@ -4508,16 +4508,8 @@ class GAMS(Solver["gamspy.Container | None"]):
             objective = m.objective_value
             objective = float(objective) if objective is not None else np.nan
 
-            # Decision variables/rows are the ones we declared, minus the
-            # bookkeeping symbols "obj"/"eobj" — looked up from the
-            # Container rather than tracked separately at build time.
             cont = m.container
-
             if self._explicit_coordinate_names:
-                # Element keys are descriptive names ("name(coord)#label"),
-                # not positions — scatter straight into label-space via the
-                # same shared utility Gurobi/Highs's from-file paths use,
-                # instead of _scatter_by_position's position-based parsing.
                 sol = np.full(self._n_vars, np.nan)
                 for var in cont.getVariables():
                     if var.name == "obj" or var.records.empty:
