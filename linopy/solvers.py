@@ -3957,8 +3957,7 @@ class GAMS(Solver["gamspy.Container | None"]):
             """
             return records if records else pd.DataFrame(columns=range(ncols))
 
-        # Collect SOS groups once: sequential group labels "s0", "s1", ... and
-        # the (group_label, column_position) pairs belonging to each type.
+        # Collect SOS groups once
         sos1_pairs: list[tuple[str, int]] = []
         sos2_pairs: list[tuple[str, int]] = []
         s_labels: list[str] = []
@@ -3986,14 +3985,6 @@ class GAMS(Solver["gamspy.Container | None"]):
         il_mask = M.sense == "<"
         ie_mask = M.sense == "="
 
-        # GAMS rejects a discrete-typed variable symbol merely *appearing* in
-        # an equation of an "lp" problem, even with zero active records; and
-        # after a solve, a Variable/Equation symbol that was never referenced
-        # by any equation of the solved model comes back with `.records`
-        # `None` regardless of its declared domain. So every block below
-        # (variable-type blocks, and the row-sense equations) is only
-        # declared -- and only spliced into eobj/eg/el/ee -- when it is
-        # actually in use; the problem type follows the same flags.
         has_jc = bool(jc_mask.any())
         has_jb = bool(jb_mask.any())
         has_ji = bool(ji_mask.any())
@@ -4019,13 +4010,13 @@ class GAMS(Solver["gamspy.Container | None"]):
             cont,
             name="j",
             records=_recs(labels_j, 1),
-            description="all columns in MPS order",
+            description="all columns",
         )
         i = gamspy.Set(
             cont,
             name="i",
             records=_recs(labels_i, 1),
-            description="all rows in MPS order",
+            description="all rows",
         )
         jc = gamspy.Set(
             cont,
@@ -4202,13 +4193,6 @@ class GAMS(Solver["gamspy.Container | None"]):
         )
 
         # --- Equations -----------------------------------------------------
-        # A Variable/Equation symbol that ends up never referenced by any
-        # equation of the solved model comes back with `.records` `None`
-        # (checked empirically), which crashes the solution-extraction loop
-        # in `_run_direct` (it expects an empty DataFrame at worst) -- so
-        # eg/el/ee (and, below, each variable-type block) are only declared
-        # when actually in use, matching the `has_ig`/`has_il`/... flags
-        # computed above.
         eobj = gamspy.Equation(cont, name="eobj", description="objective function")
         eg: Any = (
             gamspy.Equation(
@@ -4325,18 +4309,7 @@ class GAMS(Solver["gamspy.Container | None"]):
             xs2.lo[js2[s, j]] = lo[j]
             xs2.up[js2[s, j]] = up[j]
 
-        # --- Quadratic objective (mirrors the per-type-pair Domain/.where
-        # block style of a known-correct MPS-derived gamspy reformulation
-        # (see cplex.py), adapted to a flat qobj[j,jj] parameter). Unlike
-        # that reference (whose q parameter carries extra "variable stem"
-        # tag dimensions baked into its data), M.Q is a plain
-        # position-by-position matrix with no type tags -- so each block
-        # below is scoped to the correct pair of variable-kind subsets
-        # directly (jc/jb/ji/jsc/js1/js2), rather than sharing one
-        # unrestricted (j, jj) domain across every block. Sharing an
-        # unrestricted domain with an untagged parameter would let a single
-        # nonzero Q[j,jj] entry leak into every block's identical filter,
-        # injecting spurious cross-type variable references.
+        # --- Quadratic objective expression builder
         def _quad_obj_expr() -> Any:
             jj = gamspy.Alias(cont, name="jj", alias_with=j)
             plain_terms: list[tuple[Any, Any]] = []
@@ -4379,15 +4352,13 @@ class GAMS(Solver["gamspy.Container | None"]):
             )
 
             expr: Any = 0
-            # Plain-kind diagonal (same type, both same- and cross-position
-            # terms folded into one block: jj ranges over the full type
-            # subset, including positions equal to the outer index).
+            # Plain-kind same terms
             for dom, var in plain_terms:
                 expr = expr + gamspy.Sum(
                     gamspy.Domain(dom, jj).where[dom[jj] & qobj[dom, jj]],
                     0.5 * qobj[dom, jj] * var[dom] * var[jj],
                 )
-            # Plain-kind cross terms: both orderings of every distinct pair.
+            # Plain-kind cross terms
             for domA, varA in plain_terms:
                 for domB, varB in plain_terms:
                     if domA is domB:
@@ -4396,19 +4367,14 @@ class GAMS(Solver["gamspy.Container | None"]):
                         gamspy.Domain(domA, domB).where[qobj[domA, domB]],
                         0.5 * qobj[domA, domB] * varA[domA] * varB[domB],
                     )
-            # SOS-kind terms (diagonal and cross, both orderings): the
-            # "first" position in a block always goes through the group
-            # alias (jss1/jss2, existential index ss) and the "second"
-            # through the plain SOS set (js1/js2, existential index s) --
-            # this is what keeps a self-pair (e.g. js1-js1) from forcing the
-            # two positions' SOS group index to be equal to each other.
+            # SOS-kind same terms
             for domA, varA, aliasA in sos_terms:
                 for domB, varB, _ in sos_terms:
                     expr = expr + gamspy.Sum(
                         gamspy.Domain(aliasA[ss, j], domB[s, jj]).where[qobj[j, jj]],
                         0.5 * qobj[j, jj] * varA[aliasA] * varB[domB],
                     )
-            # Plain-SOS cross terms, both orderings.
+            # Plain-SOS cross terms
             for dom, var in plain_terms:
                 for domS, varS, aliasS in sos_terms:
                     expr = expr + gamspy.Sum(
