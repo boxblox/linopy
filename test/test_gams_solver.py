@@ -65,6 +65,22 @@ def test_solve_kwargs_omits_empty_partitions() -> None:
         (9, 1, TerminationCondition.internal_solver_error),
         (1, 11, TerminationCondition.licensing_problems),
         (1, 999, TerminationCondition.unknown),
+        # GAMS model status codes per
+        # https://www.gams.com/54/docs/UG_GAMSOutput.html#UG_GAMSOutput_ModelStatus
+        (1, 9, TerminationCondition.infeasible),  # Intermediate Non-Integer
+        (1, 12, TerminationCondition.internal_solver_error),  # Error Unknown
+        (1, 13, TerminationCondition.internal_solver_error),  # Error No Solution
+        (1, 14, TerminationCondition.other),  # No Solution Returned
+        (1, 15, TerminationCondition.optimal),  # Solved Unique (CNS)
+        (1, 16, TerminationCondition.optimal),  # Solved (CNS)
+        (1, 17, TerminationCondition.imprecise),  # Solved Singular
+        (1, 18, TerminationCondition.unbounded),  # Unbounded - No Solution
+        # GAMS solver status codes per
+        # https://www.gams.com/54/docs/UG_GAMSOutput.html#UG_GAMSOutput_SolverStatus
+        (4, 1, TerminationCondition.internal_solver_error),  # Terminated By Solver
+        (5, 1, TerminationCondition.error),  # Evaluation Interrupt
+        (6, 1, TerminationCondition.error),  # Capability Problems
+        (12, 1, TerminationCondition.error),  # Solve Processing Skipped
     ],
 )
 def test_status_mapping(solve_stat: int, model_stat: int, expected: str) -> None:
